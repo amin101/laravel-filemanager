@@ -1,22 +1,17 @@
 <?php namespace Unisharp\Laravelfilemanager\controllers;
 
-use Illuminate\Support\Facades\Event;
-use Unisharp\Laravelfilemanager\controllers\Controller;
-use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\File;
-use Illuminate\Support\Facades\Input;
-use Illuminate\Support\Str;
-use Lang;
 use Intervention\Image\Facades\Image;
 use Symfony\Component\HttpFoundation\File\UploadedFile;
+use Unisharp\Laravelfilemanager\Events\ImageIsUploading;
 use Unisharp\Laravelfilemanager\Events\ImageWasUploaded;
 
 /**
  * Class UploadController
  * @package Unisharp\Laravelfilemanager\controllers
  */
-class UploadController extends LfmController {
-
+class UploadController extends LfmController
+{
     private $default_file_types = ['application/pdf'];
     private $default_image_types = ['image/jpeg', 'image/png', 'image/gif'];
     // unit is assumed to be kb
@@ -31,114 +26,122 @@ class UploadController extends LfmController {
      */
     public function upload()
     {
+        $files = request()->file('upload');
+
+        if (is_array($files)) {
+            foreach ($files as $file) {
+                $this->proceedSingleUpload($file);
+            }
+
+            $response = $this->success_response;
+        } else { // upload via ckeditor 'Upload' tab
+            $new_filename = $this->proceedSingleUpload($files);
+
+            $response = $this->useFile($new_filename);
+        }
+
+        return $response;
+    }
+
+    private function proceedSingleUpload($file)
+    {
+        $validation_message = $this->uploadValidator($file);
+        if ($validation_message !== 'pass') {
+            return $validation_message;
+        }
+
+        $new_filename  = $this->getNewName($file);
+        $new_file_path = parent::getCurrentPath($new_filename);
+
+        event(new ImageIsUploading($new_file_path));
         try {
-            $res = $this->uploadValidator();
-            if (true !== $res) {
-                return Lang::get('laravel-filemanager::lfm.error-invalid');
+            if ($this->fileIsImage($file)) {
+                Image::make($file->getRealPath())
+                    ->orientate() //Apply orientation from exif data
+                    ->save($new_file_path, 90);
+
+                $this->makeThumb($new_filename);
+            } else {
+                File::move($file->path(), $new_file_path);
             }
         } catch (\Exception $e) {
-            return $e->getMessage();
+            return $this->error('invalid');
         }
-
-        $file = Input::file('upload');
-
-        $new_filename = $this->getNewName($file);
-
-        $dest_path = parent::getPath('directory');
-
-        if (File::exists($dest_path . $new_filename)) {
-            return Lang::get('laravel-filemanager::lfm.error-file-exist');
-        }
-
-        $file->move($dest_path, $new_filename);
-
-        if ('Images' === $this->file_type) {
-            $this->makeThumb($dest_path, $new_filename);
-        }
-
-        Event::fire(new ImageWasUploaded(realpath($dest_path.'/'.$new_filename)));
-
-        // upload via ckeditor 'Upload' tab
-        if (!Input::has('show_list')) {
-            return $this->useFile($new_filename);
-        }
-
-        return 'OK';
-    }
-
-    private function uploadValidator()
-    {
-        // when uploading a file with the POST named "upload"
-
-        $expected_file_type = $this->file_type;
-
-        $file = Input::file('upload');
-        if (empty($file)) {
-            throw new \Exception(Lang::get('laravel-filemanager::lfm.error-file-empty'));
-        }
-        if (!$file instanceof UploadedFile) {
-            throw new \Exception(Lang::get('laravel-filemanager::lfm.error-instance'));
-        }
-
-        $mimetype = $file->getMimeType();
-        // size to kb unit is needed
-        $size = $file->getSize() / 1000;
-
-        if ($expected_file_type === 'Files') {
-            $valid_mimetypes = Config::get('lfm.valid_file_mimetypes', $this->default_file_types);
-            $max_size = Config::get('lfm.max_file_size', $this->default_max_file_size);
-        } else {
-            $valid_mimetypes = Config::get('lfm.valid_image_mimetypes', $this->default_image_types);
-            $max_size = Config::get('lfm.max_image_size', $this->default_max_image_size);
-        }
-
-        if (!is_array($valid_mimetypes)) {
-            throw new \Exception('Config : lfm.valid_file_mimetypes is not set correctly');
-        }
-
-        if (!in_array($mimetype, $valid_mimetypes)) {
-            throw new \Exception(Lang::get('laravel-filemanager::lfm.error-mime') . $mimetype);
-        }elseif($size > $max_size){
-            throw new \Exception(Lang::get('laravel-filemanager::lfm.error-size') . $mimetype);
-        }else{
-            return true;
-        }
-    }
-
-    private function getNewName($file)
-    {
-        $file_full_name =  $file->getClientOriginalName();
-        
-        $new_filename = substr($file_full_name,0,strrpos($file_full_name,'.'));
-
-        if (Config::get('lfm.rename_file') === true) {
-            $new_filename = uniqid();
-        } elseif (Config::get('lfm.alphanumeric_filename') === true) {
-            $new_filename = preg_replace('/[^A-Za-z0-9\-\']/', '_', $new_filename);
-        }
-
-        $new_filename = $new_filename . '.' . $file->getClientOriginalExtension();
+        event(new ImageWasUploaded(realpath($new_file_path)));
 
         return $new_filename;
     }
 
-    private function makeThumb($dest_path, $new_filename)
+    private function uploadValidator($file)
     {
-        $thumb_folder_name = Config::get('lfm.thumb_folder_name');
+        $is_valid = false;
+        $force_invalid = false;
 
-        if (!File::exists($dest_path . $thumb_folder_name)) {
-            File::makeDirectory($dest_path . $thumb_folder_name);
+        if (empty($file)) {
+            return $this->error('file-empty');
+        } elseif (!$file instanceof UploadedFile) {
+            return $this->error('instance');
+        } elseif ($file->getError() == UPLOAD_ERR_INI_SIZE) {
+            $max_size = ini_get('upload_max_filesize');
+            return $this->error('file-size', ['max' => $max_size]);
+        } elseif ($file->getError() != UPLOAD_ERR_OK) {
+            return 'File failed to upload. Error code: ' . $file->getError();
         }
 
-        $thumb_img = Image::make($dest_path . $new_filename);
-        $thumb_img->fit(200, 200)
-            ->save($dest_path . $thumb_folder_name . '/' . $new_filename);
-        unset($thumb_img);
+        $new_filename = $this->getNewName($file);
+
+        if (File::exists(parent::getCurrentPath($new_filename))) {
+            return $this->error('file-exist');
+        }
+
+        $mimetype = $file->getMimeType();
+
+        // size to kb unit is needed
+        $file_size = $file->getSize() / 1000;
+        $type_key = $this->currentLfmType();
+
+        $mine_config = 'lfm.valid_' . $type_key . '_mimetypes';
+        $valid_mimetypes = config($mine_config, $this->{"default_{$type_key}_types"});
+        $max_size = config('lfm.max_' . $type_key . '_size', $this->{"default_max_{$type_key}_size"});
+
+        if (false === in_array($mimetype, $valid_mimetypes)) {
+            return $this->error('mime') . $mimetype;
+        }
+
+        if ($file_size > $max_size) {
+            return $this->error('size') . $mimetype;
+        }
+
+        return 'pass';
+    }
+
+    private function getNewName($file)
+    {
+        $new_filename = $this->translateFromUtf8(trim(pathinfo($file->getClientOriginalName(), PATHINFO_FILENAME)));
+
+        if (config('lfm.rename_file') === true) {
+            $new_filename = uniqid();
+        } elseif (config('lfm.alphanumeric_filename') === true) {
+            $new_filename = preg_replace('/[^A-Za-z0-9\-\']/', '_', $new_filename);
+        }
+
+        return $new_filename . '.' . $file->getClientOriginalExtension();
+    }
+
+    private function makeThumb($new_filename)
+    {
+        // create thumb folder
+        $this->createFolderByPath(parent::getThumbPath());
+
+        // create thumb image
+        Image::make(parent::getCurrentPath($new_filename))
+            ->fit(200, 200)
+            ->save(parent::getThumbPath($new_filename));
     }
 
     private function useFile($new_filename)
     {
-        $file = parent::getUrl() . $new_filename;
+        $file = parent::getFileUrl($new_filename);
 
         return "<script type='text/javascript'>
 
@@ -158,5 +161,4 @@ class UploadController extends LfmController {
         if (o !== false) o.CKEDITOR.tools.callFunction(funcNum, '$file');
         </script>";
     }
-
 }
